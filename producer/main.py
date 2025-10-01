@@ -1,106 +1,119 @@
 import os
 import json
+import asyncio
+import uuid
 from contextlib import asynccontextmanager
+from typing import Optional, Dict
 from fastapi import FastAPI, HTTPException
-from kafka import KafkaProducer
 from pydantic import BaseModel
+from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 
-# --- Configuration ---
-KAFKA_SERVER = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-KAFKA_TOPIC = "fastapi_messages"
+# --- Config ---
+KAFKA_SERVER = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+REQUEST_TOPIC = "fastapi_messages"
+REPLY_TOPIC = "fastapi_replies"
 
-# Global producer instance
-producer = None
+# --- Globals ---
+producer: Optional[AIOKafkaProducer] = None
+reply_consumer: Optional[AIOKafkaConsumer] = None
+pending_replies: Dict[str, asyncio.Future] = {}
 
-# --- Pydantic Schema ---
+# --- Pydantic ---
 class Message(BaseModel):
-    key: str
+    key: Optional[str]
     message: str
 
-# --- Lifecycle Management for KafkaProducer ---
-# Use the lifespan context manager to manage resources (like the Kafka Producer)
-# that should be initialized before the app starts and cleaned up when it shuts down.
+# --- FastAPI ---
+app = FastAPI(title="Kafka Producer with Reply", version="1.0")
+
+# --- Kafka lifecycle ---
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global producer
-    print(f"Connecting to Kafka at: {KAFKA_SERVER}")
-    try:
-        # Initialize the Kafka Producer
-        # value_serializer converts Python objects (like dictionaries) to JSON bytes
-        producer = KafkaProducer(
-            bootstrap_servers=[KAFKA_SERVER],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-            api_version=(0, 10, 2),
-            # Set a low timeout to quickly fail if the broker is unreachable 
-            api_version_auto_timeout_ms=5000 
-        )
-        
-        # --- NOTE: Removed the line 'producer.partitions_for_topic(KAFKA_TOPIC)' ---
-        # We rely on the Docker healthcheck (in docker-compose.yml) 
-        # to ensure Kafka is ready and on the future.get() in the /produce endpoint
-        # to handle transient connection issues.
-        
-        print("Kafka Producer initialized.")
-    except Exception as e:
-        print(f"Error connecting to Kafka (initialization failed): {e}")
-        # If construction fails, producer remains None
-        producer = None 
+    global producer, reply_consumer
+    
+    # Producer setup
+    producer = AIOKafkaProducer(
+        bootstrap_servers=[KAFKA_SERVER],
+        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    )
+    await producer.start()
+    print("Kafka Producer started.")
+    
+    # Reply consumer setup
+    reply_consumer = AIOKafkaConsumer(
+        REPLY_TOPIC,
+        bootstrap_servers=[KAFKA_SERVER],
+        group_id="fastapi_producer_reply_group",
+        value_deserializer=lambda m: json.loads(m.decode("utf-8")),
+        auto_offset_reset="earliest",
+    )
+    await reply_consumer.start()
+    print("Kafka Reply Consumer started.")
 
+    # Start background task to listen for replies
+    app.state.reply_task = asyncio.create_task(reply_listener())
+    
     yield
     
-    # --- Shutdown ---
-    if producer:
-        print("Closing Kafka Producer...")
-        producer.close()
-        print("Kafka Producer closed.")
+    # Shutdown
+    app.state.reply_task.cancel()
+    try:
+        await app.state.reply_task
+    except asyncio.CancelledError:
+        pass
+    
+    await reply_consumer.stop()
+    await producer.stop()
+    print("Kafka Producer and Reply Consumer stopped.")
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="Kafka Producer Service", 
-    version="1.0",
-    lifespan=lifespan
-)
+app.router.lifespan_context = lifespan
+
+# --- Reply listener ---
+
+async def reply_listener():
+    async for msg in reply_consumer:
+        key = msg.key.decode("utf-8") if msg.key else None
+        data = msg.value
+        if key and key in pending_replies:
+            future = pending_replies.pop(key)
+            future.set_result(data)
+            print(f"Reply received for key={key}: {data}")
 
 # --- Routes ---
 
 @app.get("/")
-def read_root():
-    """Root endpoint for status check."""
-    return {"service": "Kafka Producer", "topic": KAFKA_TOPIC, "kafka_server": KAFKA_SERVER}
+def root():
+    return {"service": "Kafka Producer with reply", "request_topic": REQUEST_TOPIC, "reply_topic": REPLY_TOPIC}
 
 @app.post("/produce")
 async def produce_message(msg: Message):
-    """
-    Publishes a message to the configured Kafka topic.
-    """
     if not producer:
-        raise HTTPException(status_code=503, detail="Kafka Producer is not initialized. Check service logs for connection errors.")
+        raise HTTPException(503, "Kafka Producer is not initialized")
+    
+    # Use given key or generate UUID
+    correlation_id = msg.key or str(uuid.uuid4())
+    data = {"content": msg.message}
+    
+    future = asyncio.get_event_loop().create_future()
+    pending_replies[correlation_id] = future
 
     try:
-        data = {"content": msg.message}
-        
-        # Send the message. The key is used for partitioning.
-        future = producer.send(
-            topic=KAFKA_TOPIC,
-            key=msg.key.encode('utf-8'),
-            value=data
+        await producer.send_and_wait(
+            topic=REQUEST_TOPIC,
+            key=correlation_id.encode("utf-8"),
+            value=data,
         )
+        print(f"Message sent with key={correlation_id}")
 
-        # Wait for the message to be sent and log metadata (This is where true connectivity is tested)
-        record_metadata = future.get(timeout=10)
-        
-        print(f"Message sent successfully!")
-        print(f"Topic: {record_metadata.topic}, Partition: {record_metadata.partition}, Offset: {record_metadata.offset}")
+        # Wait for reply (timeout 10 seconds)
+        reply = await asyncio.wait_for(future, timeout=10)
+        return {"status": "success", "key": correlation_id, "reply": reply}
 
-        return {
-            "status": "success",
-            "message": "Message published to Kafka",
-            "key": msg.key,
-            "data": msg.message
-        }
+    except asyncio.TimeoutError:
+        pending_replies.pop(correlation_id, None)
+        raise HTTPException(504, "Timeout waiting for reply")
 
     except Exception as e:
-        # Catch exceptions like KafkaTimeoutError from future.get()
-        producer.flush() 
-        print(f"Error sending message: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to publish message: {e}. Kafka broker may be down or unreachable.")
+        pending_replies.pop(correlation_id, None)
+        raise HTTPException(500, f"Error producing message: {e}")
