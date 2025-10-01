@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  producer_app:
+    build:
+      context: ./producer
+      dockerfile: Dockerfile
+    container_name: producer_app
+    hostname: producer_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+  consumer_app:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: consumer_app
+    hostname: consumer_app
+    command: uvicorn main:app --host 0.0.0.0 --port 8001 --reload
+    ports:
+      - "8001:8001"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+networks:
+  kafka-net:
+    external: true
